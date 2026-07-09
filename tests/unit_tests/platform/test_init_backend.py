@@ -69,3 +69,12 @@ class TestInitBackendVendorAutoImport:
             p.init_backend()
             p.init_backend()
         assert caplog.text.count("vendor_module=loaded") == 3
+
+    def test_iluvatar_register_platform_registers_backend(self, caplog):
+        p = _make_platform_stub("iluvatar")
+        with caplog.at_level(logging.INFO, logger="sglang_fl.platform"):
+            p.init_backend()
+        assert "vendor_module=loaded" in caplog.text
+        from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+
+        assert "iluvatar_fa" in ATTENTION_BACKENDS
