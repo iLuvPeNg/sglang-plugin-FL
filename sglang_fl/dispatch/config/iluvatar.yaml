@@ -1,6 +1,2 @@
 # SGLang-FL Dispatch Configuration for Iluvatar platform
-#
-# Decode CUDA graph: enabled by default when attention_backend is triton
-# (PlatformFL default). Use USE_FLAGGEMS=0 for reasonable graph capture time.
-# Piecewise graph stays off (--disable-piecewise-cuda-graph) due to FlagGems.
 prefer: flagos

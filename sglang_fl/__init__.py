@@ -725,6 +725,20 @@ def activate_platform() -> str | None:
 _plugin_loaded = False
 
 
+def _register_iluvatar_attention_backend() -> None:
+    try:
+        try:
+            from flag_gems.runtime.backend.device import DeviceDetector
+        except ImportError:
+            from flag_gems.runtime.backend.device_finder import DeviceDetector
+
+        if DeviceDetector().vendor_name != "iluvatar":
+            return
+        import sglang_fl.dispatch.backends.vendor.iluvatar.register_platform  # noqa: F401
+    except Exception as exc:
+        logger.warning("Iluvatar fa2 attention backend registration skipped: %s", exc)
+
+
 def load_plugin():
     """Entry point for sglang.srt.plugins — called by SGLang's load_plugins().
 
@@ -734,6 +748,8 @@ def load_plugin():
     if _plugin_loaded:
         return
     _plugin_loaded = True
+
+    _register_iluvatar_attention_backend()
 
     # Suppress info logs on non-rank-0 processes to avoid duplicate output
     if not _is_rank0():

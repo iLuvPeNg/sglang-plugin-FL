@@ -1,33 +1,38 @@
-"""Iluvatar Flash Attention backend (WIP).
-
-Uses Corex ``flash_attn`` 2.8.3 (``flash_attn.flash_attn_interface``) instead of
-sglang's ``jit_kernel.flash_attention`` / ``sgl_kernel``, which require SM>=80.
-
-Implementation notes for the follow-up work:
-  - prefill/extend: ``flash_attn_varlen_func`` (already verified on MR-V100)
-  - decode/kvcache: ``flash_attn_with_kvcache`` with Corex layout
-    ``k_cache: (batch, nheads_k, seqlen_cache, headdim)`` and ``is_qkv_packed=True``
-  - CUDA graph: copy metadata hooks from ``TritonAttnBackend`` or
-    ``FlashAttentionBackend`` (init_cuda_graph_state, capture/replay metadata)
-  - Keep ``platform._ATTN_BACKEND_MAP["iluvatar"] = "triton"`` until this backend
-    passes graph + accuracy tests; then switch default to ``iluvatar_fa``.
-"""
+# Iluvatar FA2 attention backend using Corex flash_attn.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import sys
+import types
 
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang_fl.dispatch.backends.vendor.iluvatar.impl import flash_attn_ops
 
 
-class IluvatarFlashAttentionBackend(AttentionBackend):
-    """OOT FA backend for Iluvatar; registered as ``iluvatar_fa``."""
+def _install_corex_flash_attn_shim() -> None:
+    mod = types.ModuleType("sgl_kernel.flash_attn")
+    mod.flash_attn_varlen_func = flash_attn_ops.flash_attn_varlen_func
+    mod.flash_attn_with_kvcache = flash_attn_ops.flash_attn_with_kvcache
+    mod.get_scheduler_metadata = flash_attn_ops.get_scheduler_metadata
+    sys.modules["sgl_kernel.flash_attn"] = mod
 
-    def __init__(self, model_runner: ModelRunner):
-        super().__init__()
-        raise NotImplementedError(
-            "IluvatarFlashAttentionBackend is scaffold-only on feat/iluvatar-flash-attention"
-        )
+
+def _patch_flashattention_backend_module() -> None:
+    import sglang.srt.layers.attention.flashattention_backend as fab
+
+    fab.flash_attn_varlen_func = flash_attn_ops.flash_attn_varlen_func
+    fab.flash_attn_with_kvcache = flash_attn_ops.flash_attn_with_kvcache
+
+
+class IluFlashAttentionBackend(FlashAttentionBackend):
+    """FA2 backend for Iluvatar via Corex flash_attn."""
+
+    def __init__(self, model_runner, **kwargs):
+        _install_corex_flash_attn_shim()
+        _patch_flashattention_backend_module()
+        super().__init__(model_runner, fa_impl_ver=3, **kwargs)
+        self.fa_impl_ver = 2
+        self._get_scheduler_metadata = None
+        self.flash_attn_varlen_func = flash_attn_ops.flash_attn_varlen_func
+        self.flash_attn_with_kvcache = flash_attn_ops.flash_attn_with_kvcache

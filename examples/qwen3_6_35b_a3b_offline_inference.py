@@ -9,10 +9,11 @@ Usage:
   python qwen3_6_35b_a3b_offline_inference.py
 
 Environment variables:
-  MODEL_PATH    Model path (default: /models/Qwen3.6-35B-A3B)
-  TP_SIZE       Tensor parallelism (default: 1)
-  MAX_TOKENS    Max generation tokens (default: 10)
-  IMAGE_DIR     Test image directory (default: examples/test_images/ next to this file)
+  MODEL_PATH         Model path (default: /models/Qwen3.6-35B-A3B)
+  TP_SIZE            Tensor parallelism (default: 1)
+  MAX_TOKENS         Max generation tokens (default: 10)
+  IMAGE_DIR          Test image directory (default: examples/test_images/ next to this file)
+  WATCHDOG_TIMEOUT   Scheduler watchdog in seconds (default: 3600).
 """
 
 import os
@@ -38,6 +39,7 @@ if _is_npu:
 MODEL_PATH = os.environ.get("MODEL_PATH", "/models/Qwen3.6-35B-A3B")
 TP_SIZE = int(os.environ.get("TP_SIZE", "4" if _is_npu else "1"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "10"))
+WATCHDOG_TIMEOUT = float(os.environ.get("WATCHDOG_TIMEOUT", "3600"))
 
 _HERE = Path(__file__).resolve().parent
 IMAGE_DIR = Path(os.environ.get("IMAGE_DIR", _HERE / "test_images"))
@@ -147,12 +149,14 @@ def _image_uri(name: str) -> str:
 def run_engine():
     from sglang.srt.entrypoints.engine import Engine
 
+    print(f"watchdog_timeout={WATCHDOG_TIMEOUT}s")
     engine = Engine(
         model_path=MODEL_PATH,
         tp_size=TP_SIZE,
         mem_fraction_static=0.85,
         disable_cuda_graph=True,
         disable_piecewise_cuda_graph=True,
+        watchdog_timeout=WATCHDOG_TIMEOUT,
         **_extra_engine_kwargs,
     )
 
