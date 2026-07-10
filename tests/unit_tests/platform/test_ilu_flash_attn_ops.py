@@ -52,14 +52,14 @@ def test_n_heads_k_page_size_one():
     assert flash_attn_ops._n_heads_k_from_cache(k_paged, gathered=False) == 16
     k_gathered = torch.randn(24, 16, 128, 64, device="cuda", dtype=torch.float16)
     assert flash_attn_ops._n_heads_k_from_cache(
-        k_gathered, gathered=True, max_seqlen=128
+        k_gathered, gathered=True, max_len=128
     ) == 16
     k_capture = torch.randn(24, 1, 16, 64, device="cuda", dtype=torch.float16)
     assert flash_attn_ops._n_heads_k_from_cache(
-        k_capture, gathered=True, max_seqlen=1
+        k_capture, gathered=True, max_len=1
     ) == 16
     assert flash_attn_ops._n_heads_k_from_cache(
-        k_capture, gathered=True, max_seqlen=0
+        k_capture, gathered=True, max_len=0
     ) == 16
 
 
@@ -89,11 +89,70 @@ def test_gather_limits_by_cache_seqlens_not_page_table_width():
     page_table_long = torch.randint(
         0, num_blocks, (B, 48), dtype=torch.int32, device="cuda"
     )
-    k_long, v_long = flash_attn_ops._gather_paged_kv_cache(
-        k_cache, v_cache, page_table_long, cache_seqlens_long
+    k_decode, v_decode = flash_attn_ops._gather_paged_kv_cache(
+        k_cache, v_cache, page_table_long, cache_seqlens_long, max_seqlen_q=1
     )[:2]
-    assert k_long.shape == (B, Hkv, 48, D)
-    assert v_long.shape == (B, Hkv, 48, D)
+    assert k_decode.shape == (B, Hkv, 48, D)
+    assert v_decode.shape == (B, Hkv, 48, D)
+    k_prefill, v_prefill = flash_attn_ops._gather_paged_kv_cache(
+        k_cache,
+        v_cache,
+        page_table_long,
+        cache_seqlens_long,
+        max_seqlen_q=48,
+    )[:2]
+    assert k_prefill.shape == (B, Hkv, 48, D)
+    assert v_prefill.shape == (B, Hkv, 48, D)
+
+
+def test_gather_decode_uses_kv_len_not_query_len():
+    page_size = 1
+    num_blocks = 256
+    Hkv, D = 16, 128
+    B = 4
+    k_cache = torch.randn(
+        num_blocks, page_size, Hkv, D, device="cuda", dtype=torch.float16
+    )
+    v_cache = torch.randn(
+        num_blocks, page_size, Hkv, D, device="cuda", dtype=torch.float16
+    )
+    cache_seqlens = torch.full((B,), 48, dtype=torch.int32, device="cuda")
+    page_table = torch.randint(
+        0, num_blocks, (B, 48), dtype=torch.int32, device="cuda"
+    )
+    k, v, kv_len = flash_attn_ops._gather_paged_kv_cache(
+        k_cache, v_cache, page_table, cache_seqlens, max_seqlen_q=1
+    )
+    assert kv_len == 48
+    assert k.shape == (B, Hkv, 48, D)
+    assert v.shape == (B, Hkv, 48, D)
+
+
+def test_gather_capture_safe_decode_len():
+    page_size = 1
+    num_blocks = 64
+    Hkv, D = 8, 64
+    B = 2
+    k_cache = torch.randn(
+        num_blocks, page_size, Hkv, D, device="cuda", dtype=torch.float16
+    )
+    v_cache = torch.randn(
+        num_blocks, page_size, Hkv, D, device="cuda", dtype=torch.float16
+    )
+    cache_seqlens = torch.full((B,), 48, dtype=torch.int32, device="cuda")
+    page_table = torch.randint(
+        0, num_blocks, (B, 48), dtype=torch.int32, device="cuda"
+    )
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=stream):
+            k, v, kv_len = flash_attn_ops._gather_paged_kv_cache(
+                k_cache, v_cache, page_table, cache_seqlens, max_seqlen_q=1
+            )
+    assert kv_len == 1
+    assert k.shape == (B, 1, Hkv, D)
+    assert v.shape == (B, 1, Hkv, D)
 
 
 def test_extend_varlen_prefill_runs():

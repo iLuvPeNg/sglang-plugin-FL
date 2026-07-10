@@ -93,19 +93,49 @@ def _filter_kwargs(kwargs: dict[str, Any], allowed: frozenset[str]) -> dict[str,
     return out
 
 
+def _is_cuda_graph_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        return False
+
+
+def _resolve_gather_len(
+    cache_seqlens: torch.Tensor,
+    table_cap: int,
+    *,
+    max_seqlen_q: Optional[int],
+) -> int:
+    """Resolve how many KV tokens to gather from the paged table.
+
+  Prefill / varlen keeps the real KV length. Single-token decode avoids
+  ``cache_seqlens.max().item()`` while a CUDA graph is being captured; the
+  capture path uses length 1 (SGLang's decode graph fill value).
+    """
+    if max_seqlen_q is not None and int(max_seqlen_q) > 1:
+        max_len = int(cache_seqlens.max().item())
+    elif _is_cuda_graph_capturing():
+        max_len = 1
+    else:
+        max_len = int(cache_seqlens.max().item())
+    return min(max(max_len, 1), table_cap)
+
+
 def _gather_paged_kv_cache(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
+    *,
+    max_seqlen_q: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Gather paged KV into Corex contiguous layout.
+    """Gather paged KV into contiguous layout for ``flash_attn_with_kvcache``.
 
-    Corex ``flash_attn_with_kvcache`` layout on MR-V100:
-      - seqlen == 1: ``(B, S, H, D)`` (BSHD)
-      - seqlen  > 1: ``(B, H, S, D)`` (BHSD)
-
-    Returns ``(k, v, max_len)`` where ``max_len`` is the layout seqlen used.
+    Layout follows gathered KV length:
+      - ``max_len <= 1``: ``(B, S_kv, H, D)`` (BSHD)
+      - ``max_len  > 1``: ``(B, H, S_kv, D)`` (BHSD)
     """
     _num_blocks, page_size, n_heads, head_dim = k_cache.shape
     batch_size = page_table.shape[0]
@@ -116,11 +146,8 @@ def _gather_paged_kv_cache(
     page_table = page_table.contiguous()
     cache_seqlens = cache_seqlens.contiguous()
 
-    max_len = int(cache_seqlens.max().item())
     table_cap = page_table.shape[1] * page_size
-    max_len = min(max_len, table_cap)
-    if max_len <= 0:
-        max_len = 1
+    max_len = _resolve_gather_len(cache_seqlens, table_cap, max_seqlen_q=max_seqlen_q)
 
     positions = torch.arange(max_len, device=device, dtype=torch.int32)
     block_indices = positions // page_size
@@ -131,8 +158,7 @@ def _gather_paged_kv_cache(
     k_tokens = k_src[blocks, offs].reshape(batch_size, max_len, n_heads, head_dim)
     v_tokens = v_src[blocks, offs].reshape(batch_size, max_len, n_heads, head_dim)
 
-    # Fresh contiguous storage; avoids FlagGems/view stride quirks into cuINFER.
-    if max_len == 1:
+    if max_len <= 1:
         return k_tokens.contiguous().clone(), v_tokens.contiguous().clone(), max_len
     k_cont = k_tokens.permute(0, 2, 1, 3).contiguous().clone()
     v_cont = v_tokens.permute(0, 2, 1, 3).contiguous().clone()
@@ -140,13 +166,12 @@ def _gather_paged_kv_cache(
 
 
 def _n_heads_k_from_cache(
-    k_cache: torch.Tensor, *, gathered: bool, max_seqlen: int = 0
+    k_cache: torch.Tensor, *, gathered: bool, max_len: int = 1
 ) -> int:
     if k_cache.ndim != 4:
         raise ValueError(f"unexpected k_cache shape: {k_cache.shape}")
     if gathered:
-        # Keep <=1 in sync with gather's BSHD branch (handles seqlens==0).
-        return int(k_cache.shape[2] if max_seqlen <= 1 else k_cache.shape[1])
+        return int(k_cache.shape[2] if max_len <= 1 else k_cache.shape[1])
     return int(k_cache.shape[2])
 
 
@@ -184,10 +209,10 @@ def _pack_q_for_corex(
     if k is not None and v is not None:
         k = _ensure_bshd(k, "k")
         v = _ensure_bshd(v, "v")
-        return torch.cat([q, k, v], dim=2)
+        return torch.cat([q, k, v], dim=2).contiguous()
     batch, seqlen, _n_heads_q, head_dim = q.shape
     zeros = q.new_zeros(batch, seqlen, n_heads_k, head_dim)
-    return torch.cat([q, zeros, zeros], dim=2)
+    return torch.cat([q, zeros, zeros], dim=2).contiguous()
 
 
 def flash_attn_varlen_func(
@@ -222,9 +247,8 @@ def flash_attn_varlen_func(
     )
 
 
-def _gathered_cache_to_shd(k_gathered: torch.Tensor, max_seqlen: int) -> torch.Tensor:
-    # Match gather layout: seqlen<=1 stays BSHD, seqlen>1 is BHSD.
-    if max(int(max_seqlen), 1) == 1:
+def _gathered_cache_to_shd(k_gathered: torch.Tensor, max_len: int) -> torch.Tensor:
+    if max_len <= 1:
         return k_gathered[0].contiguous()
     return k_gathered[0].permute(1, 0, 2).contiguous()
 
@@ -245,12 +269,15 @@ def _flash_attn_varlen_from_paged_cache(
     v_parts = []
     for i in range(batch_size):
         cs_i = cache_seqlens[i : i + 1].contiguous()
-        max_i = int(cs_i.item())
-        k_i, v_i, layout_len = _gather_paged_kv_cache(
-            k_cache, v_cache, page_table[i : i + 1], cs_i
+        k_i, v_i, kv_len = _gather_paged_kv_cache(
+            k_cache,
+            v_cache,
+            page_table[i : i + 1],
+            cs_i,
+            max_seqlen_q=max_seqlen_q,
         )
-        k_parts.append(_gathered_cache_to_shd(k_i, layout_len))
-        v_parts.append(_gathered_cache_to_shd(v_i, layout_len))
+        k_parts.append(_gathered_cache_to_shd(k_i, kv_len))
+        v_parts.append(_gathered_cache_to_shd(v_i, kv_len))
 
     k = torch.cat(k_parts, dim=0)
     v = torch.cat(v_parts, dim=0)
@@ -329,8 +356,12 @@ def flash_attn_with_kvcache(
             )
 
         n_heads_k = int(k_cache.shape[2])
-        k_cache, v_cache, _max_seqlen = _gather_paged_kv_cache(
-            k_cache, v_cache, page_table, cache_seqlens
+        k_cache, v_cache, kv_len = _gather_paged_kv_cache(
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            max_seqlen_q=max_seqlen_q,
         )
         filtered["cache_seqlens"] = cache_seqlens
     else:
