@@ -77,4 +77,8 @@ class TestInitBackendVendorAutoImport:
         assert "vendor_module=loaded" in caplog.text
         from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 
-        assert "iluvatar_fa" in ATTENTION_BACKENDS
+        assert "fa2" in ATTENTION_BACKENDS
+
+        from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+
+        assert "fa2" in ATTENTION_BACKEND_CHOICES

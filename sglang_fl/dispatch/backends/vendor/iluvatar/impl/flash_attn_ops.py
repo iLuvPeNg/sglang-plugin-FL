@@ -98,8 +98,16 @@ def _gather_paged_kv_cache(
     v_cache: torch.Tensor,
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    _num_blocks, page_size, _n_heads, _head_dim = k_cache.shape
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Gather paged KV into Corex contiguous layout.
+
+    Corex ``flash_attn_with_kvcache`` layout on MR-V100:
+      - seqlen == 1: ``(B, S, H, D)`` (BSHD)
+      - seqlen  > 1: ``(B, H, S, D)`` (BHSD)
+
+    Returns ``(k, v, max_len)`` where ``max_len`` is the layout seqlen used.
+    """
+    _num_blocks, page_size, n_heads, head_dim = k_cache.shape
     batch_size = page_table.shape[0]
     device = k_cache.device
 
@@ -120,14 +128,15 @@ def _gather_paged_kv_cache(
 
     blocks = page_table[:, block_indices.long()]
     offs = offsets.unsqueeze(0).expand(batch_size, -1)
-    k_tokens = k_src[blocks, offs]
-    v_tokens = v_src[blocks, offs]
+    k_tokens = k_src[blocks, offs].reshape(batch_size, max_len, n_heads, head_dim)
+    v_tokens = v_src[blocks, offs].reshape(batch_size, max_len, n_heads, head_dim)
 
+    # Fresh contiguous storage; avoids FlagGems/view stride quirks into cuINFER.
     if max_len == 1:
-        return k_tokens.contiguous(), v_tokens.contiguous()
-    k_cont = k_tokens.permute(0, 2, 1, 3).contiguous()
-    v_cont = v_tokens.permute(0, 2, 1, 3).contiguous()
-    return k_cont, v_cont
+        return k_tokens.contiguous().clone(), v_tokens.contiguous().clone(), max_len
+    k_cont = k_tokens.permute(0, 2, 1, 3).contiguous().clone()
+    v_cont = v_tokens.permute(0, 2, 1, 3).contiguous().clone()
+    return k_cont, v_cont, max_len
 
 
 def _n_heads_k_from_cache(
@@ -136,7 +145,8 @@ def _n_heads_k_from_cache(
     if k_cache.ndim != 4:
         raise ValueError(f"unexpected k_cache shape: {k_cache.shape}")
     if gathered:
-        return int(k_cache.shape[2] if max_seqlen == 1 else k_cache.shape[1])
+        # Keep <=1 in sync with gather's BSHD branch (handles seqlens==0).
+        return int(k_cache.shape[2] if max_seqlen <= 1 else k_cache.shape[1])
     return int(k_cache.shape[2])
 
 
@@ -213,7 +223,8 @@ def flash_attn_varlen_func(
 
 
 def _gathered_cache_to_shd(k_gathered: torch.Tensor, max_seqlen: int) -> torch.Tensor:
-    if max_seqlen == 1:
+    # Match gather layout: seqlen<=1 stays BSHD, seqlen>1 is BHSD.
+    if max(int(max_seqlen), 1) == 1:
         return k_gathered[0].contiguous()
     return k_gathered[0].permute(1, 0, 2).contiguous()
 
@@ -235,11 +246,11 @@ def _flash_attn_varlen_from_paged_cache(
     for i in range(batch_size):
         cs_i = cache_seqlens[i : i + 1].contiguous()
         max_i = int(cs_i.item())
-        k_i, v_i = _gather_paged_kv_cache(
+        k_i, v_i, layout_len = _gather_paged_kv_cache(
             k_cache, v_cache, page_table[i : i + 1], cs_i
         )
-        k_parts.append(_gathered_cache_to_shd(k_i, max_i))
-        v_parts.append(_gathered_cache_to_shd(v_i, max_i))
+        k_parts.append(_gathered_cache_to_shd(k_i, layout_len))
+        v_parts.append(_gathered_cache_to_shd(v_i, layout_len))
 
     k = torch.cat(k_parts, dim=0)
     v = torch.cat(v_parts, dim=0)
@@ -276,9 +287,9 @@ def flash_attn_with_kvcache(
     cu_seqlens_k = kwargs.pop("cu_seqlens_k_new", None)
     max_seqlen_q = kwargs.pop("max_seqlen_q", None)
     filtered = _filter_kwargs(kwargs, _KVCACHE_ALLOWED)
-    gathered = False
-    max_seqlen = 0
     n_heads_q = _n_heads_q_from_q(q)
+    # Paged pool is always (num_blocks, page_size, H, D); read H before gather.
+    n_heads_k = int(k_cache.shape[2]) if k_cache.ndim == 4 else 0
 
     if page_table is not None:
         cache_seqlens = filtered.get("cache_seqlens")
@@ -317,14 +328,13 @@ def flash_attn_with_kvcache(
                 **varlen_kwargs,
             )
 
-        max_seqlen = int(cache_seqlens.max().item())
-        k_cache, v_cache = _gather_paged_kv_cache(
+        n_heads_k = int(k_cache.shape[2])
+        k_cache, v_cache, _max_seqlen = _gather_paged_kv_cache(
             k_cache, v_cache, page_table, cache_seqlens
         )
-        gathered = True
         filtered["cache_seqlens"] = cache_seqlens
     else:
-        max_seqlen = 0
+        n_heads_k = _n_heads_k_from_cache(k_cache, gathered=False)
 
     q = maybe_contiguous(q)
     if k is not None:
@@ -335,13 +345,12 @@ def flash_attn_with_kvcache(
         q,
         k,
         v,
-        n_heads_k=_n_heads_k_from_cache(
-            k_cache, gathered=gathered, max_seqlen=max_seqlen
-        ),
+        n_heads_k=n_heads_k,
     )
     filtered.pop("k", None)
     filtered.pop("v", None)
     filtered["is_qkv_packed"] = True
+    filtered.setdefault("rotary_interleaved", False)
 
     q = maybe_contiguous(q)
     k_cache = maybe_contiguous(k_cache)
