@@ -102,17 +102,24 @@ def _is_cuda_graph_capturing() -> bool:
         return False
 
 
+# cuINFER rejects BHSD caches whose seqlen dim is 1: after contiguous(), a
+# size-1 dim can keep a non-unit stride and the kernel treats it as unsupported.
+_MIN_KVCACHE_SEQLEN = 2
+
+
 def _resolve_gather_len(
     cache_seqlens: torch.Tensor,
     table_cap: int,
     *,
     max_seqlen_q: Optional[int],
+    min_seqlen: int,
 ) -> int:
     """Resolve how many KV tokens to gather from the paged table.
 
-  Prefill / varlen keeps the real KV length. Single-token decode avoids
-  ``cache_seqlens.max().item()`` while a CUDA graph is being captured; the
-  capture path uses length 1 (SGLang's decode graph fill value).
+    Prefill / varlen keeps the real KV length. Single-token decode avoids
+    ``cache_seqlens.max().item()`` while a CUDA graph is being captured; the
+    capture path uses length 1 (SGLang's decode graph fill value), then the
+    gather may pad to ``min_seqlen`` for a valid BHSD stride.
     """
     if max_seqlen_q is not None and int(max_seqlen_q) > 1:
         max_len = int(cache_seqlens.max().item())
@@ -120,7 +127,12 @@ def _resolve_gather_len(
         max_len = 1
     else:
         max_len = int(cache_seqlens.max().item())
-    return min(max(max_len, 1), table_cap)
+    max_len = max(max_len, 1)
+    # Pad short caches so BHSD seqlen has a real stride for cuINFER. Attention
+    # still respects cache_seqlens, so padded tokens are ignored on kvcache path.
+    if max_len < min_seqlen and table_cap >= min_seqlen:
+        max_len = min_seqlen
+    return min(max_len, table_cap)
 
 
 def _gather_paged_kv_cache(
@@ -130,12 +142,13 @@ def _gather_paged_kv_cache(
     cache_seqlens: torch.Tensor,
     *,
     max_seqlen_q: Optional[int] = None,
+    min_seqlen: int = _MIN_KVCACHE_SEQLEN,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Gather paged KV into contiguous layout for ``flash_attn_with_kvcache``.
+    """Gather paged KV into contiguous BHSD ``(B, H, S, D)`` for kvcache.
 
-    Layout follows gathered KV length:
-      - ``max_len <= 1``: ``(B, S_kv, H, D)`` (BSHD)
-      - ``max_len  > 1``: ``(B, H, S_kv, D)`` (BHSD)
+    Always returns BHSD. When the logical cache length is below ``min_seqlen``,
+    gathers extra tokens so the seqlen stride is valid for cuINFER;
+    ``cache_seqlens`` still limits which tokens attend on the kvcache path.
     """
     _num_blocks, page_size, n_heads, head_dim = k_cache.shape
     batch_size = page_table.shape[0]
@@ -147,7 +160,12 @@ def _gather_paged_kv_cache(
     cache_seqlens = cache_seqlens.contiguous()
 
     table_cap = page_table.shape[1] * page_size
-    max_len = _resolve_gather_len(cache_seqlens, table_cap, max_seqlen_q=max_seqlen_q)
+    max_len = _resolve_gather_len(
+        cache_seqlens,
+        table_cap,
+        max_seqlen_q=max_seqlen_q,
+        min_seqlen=min_seqlen,
+    )
 
     positions = torch.arange(max_len, device=device, dtype=torch.int32)
     block_indices = positions // page_size
@@ -158,8 +176,7 @@ def _gather_paged_kv_cache(
     k_tokens = k_src[blocks, offs].reshape(batch_size, max_len, n_heads, head_dim)
     v_tokens = v_src[blocks, offs].reshape(batch_size, max_len, n_heads, head_dim)
 
-    if max_len <= 1:
-        return k_tokens.contiguous().clone(), v_tokens.contiguous().clone(), max_len
+    # BHSD with a real seqlen stride (..., head_dim, 1).
     k_cont = k_tokens.permute(0, 2, 1, 3).contiguous().clone()
     v_cont = v_tokens.permute(0, 2, 1, 3).contiguous().clone()
     return k_cont, v_cont, max_len
@@ -171,7 +188,8 @@ def _n_heads_k_from_cache(
     if k_cache.ndim != 4:
         raise ValueError(f"unexpected k_cache shape: {k_cache.shape}")
     if gathered:
-        return int(k_cache.shape[2] if max_len <= 1 else k_cache.shape[1])
+        # Gathered cache is always BHSD (B, H, S, D).
+        return int(k_cache.shape[1])
     return int(k_cache.shape[2])
 
 
@@ -248,8 +266,8 @@ def flash_attn_varlen_func(
 
 
 def _gathered_cache_to_shd(k_gathered: torch.Tensor, max_len: int) -> torch.Tensor:
-    if max_len <= 1:
-        return k_gathered[0].contiguous()
+    # Gathered cache is BHSD (1, H, S, D) -> varlen SHD (S, H, D).
+    del max_len
     return k_gathered[0].permute(1, 0, 2).contiguous()
 
 
@@ -275,9 +293,18 @@ def _flash_attn_varlen_from_paged_cache(
             page_table[i : i + 1],
             cs_i,
             max_seqlen_q=max_seqlen_q,
+            min_seqlen=1,
         )
-        k_parts.append(_gathered_cache_to_shd(k_i, kv_len))
-        v_parts.append(_gathered_cache_to_shd(v_i, kv_len))
+        # Trim pad so varlen cu_seqlens_k stays exact.
+        actual = max(int(cs_i.item()), 0)
+        k_shd = _gathered_cache_to_shd(k_i, kv_len)
+        v_shd = _gathered_cache_to_shd(v_i, kv_len)
+        if actual == 0:
+            k_parts.append(k_shd[:0])
+            v_parts.append(v_shd[:0])
+        else:
+            k_parts.append(k_shd[:actual])
+            v_parts.append(v_shd[:actual])
 
     k = torch.cat(k_parts, dim=0)
     v = torch.cat(v_parts, dim=0)

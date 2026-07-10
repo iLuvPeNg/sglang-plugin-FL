@@ -54,12 +54,9 @@ def test_n_heads_k_page_size_one():
     assert flash_attn_ops._n_heads_k_from_cache(
         k_gathered, gathered=True, max_len=128
     ) == 16
-    k_capture = torch.randn(24, 1, 16, 64, device="cuda", dtype=torch.float16)
+    k_capture = torch.randn(24, 16, 2, 64, device="cuda", dtype=torch.float16)
     assert flash_attn_ops._n_heads_k_from_cache(
-        k_capture, gathered=True, max_len=1
-    ) == 16
-    assert flash_attn_ops._n_heads_k_from_cache(
-        k_capture, gathered=True, max_len=0
+        k_capture, gathered=True, max_len=2
     ) == 16
 
 
@@ -79,11 +76,14 @@ def test_gather_limits_by_cache_seqlens_not_page_table_width():
     page_table = torch.randint(
         0, num_blocks, (B, max_context), dtype=torch.int32, device="cuda"
     )
-    k, v = flash_attn_ops._gather_paged_kv_cache(
+    k, v, kv_len = flash_attn_ops._gather_paged_kv_cache(
         k_cache, v_cache, page_table, cache_seqlens
-    )[:2]
-    assert k.shape == (B, 1, Hkv, D)
-    assert v.shape == (B, 1, Hkv, D)
+    )
+    # Logical len=1 is padded to 2 for valid BHSD strides.
+    assert kv_len == 2
+    assert k.shape == (B, Hkv, 2, D)
+    assert v.shape == (B, Hkv, 2, D)
+    assert k.stride()[-1] == 1 and k.stride()[-2] == D
 
     cache_seqlens_long = torch.full((B,), 48, dtype=torch.int32, device="cuda")
     page_table_long = torch.randint(
@@ -150,9 +150,11 @@ def test_gather_capture_safe_decode_len():
             k, v, kv_len = flash_attn_ops._gather_paged_kv_cache(
                 k_cache, v_cache, page_table, cache_seqlens, max_seqlen_q=1
             )
-    assert kv_len == 1
-    assert k.shape == (B, 1, Hkv, D)
-    assert v.shape == (B, 1, Hkv, D)
+    # Capture forces logical len=1, then pads to 2 for BHSD.
+    assert kv_len == 2
+    assert k.shape == (B, Hkv, 2, D)
+    assert v.shape == (B, Hkv, 2, D)
+    assert k.stride() == (Hkv * 2 * D, 2 * D, D, 1)
 
 
 def test_extend_varlen_prefill_runs():
