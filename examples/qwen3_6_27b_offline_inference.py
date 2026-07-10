@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.6-27B (Dense, hybrid attention) offline inference with sglang-plugin-FL.
 
-Supports CUDA, MUSA, and Ascend NPU; platform-specific settings are applied
-automatically at runtime.
+Supports CUDA, Corex, MUSA, and Ascend NPU; platform-specific settings are
+applied automatically at runtime.
 
 Usage:
   python qwen3_6_27b_offline_inference.py
@@ -13,8 +13,6 @@ Environment variables:
   TP_SIZE            Tensor parallelism (default: 1)
   MAX_TOKENS         Max generation tokens (default: 10)
   IMAGE_DIR          Test image directory (default: examples/test_images/ next to this file)
-  WATCHDOG_TIMEOUT   Scheduler watchdog in seconds (default: 3600). First-run kernel
-                     JIT can exceed the sglang default of 300s.
 """
 
 import os
@@ -27,6 +25,7 @@ import torch
 
 _is_musa = hasattr(torch, "musa") and torch.musa.is_available()
 _is_npu = hasattr(torch, "npu") and torch.npu.is_available()
+_is_corex = hasattr(torch, "corex") and torch.cuda.is_available()
 
 # Must be set before importing sglang.
 if _is_npu:
@@ -40,7 +39,6 @@ if _is_npu:
 MODEL_PATH = os.environ.get("MODEL_PATH", "/models/Qwen3.6-27B")
 TP_SIZE = int(os.environ.get("TP_SIZE", "4" if _is_npu else "1"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "10"))
-WATCHDOG_TIMEOUT = float(os.environ.get("WATCHDOG_TIMEOUT", "3600"))
 
 _HERE = Path(__file__).resolve().parent
 IMAGE_DIR = Path(os.environ.get("IMAGE_DIR", _HERE / "test_images"))
@@ -56,6 +54,15 @@ elif _is_npu:
         "dtype": "bfloat16",
         "trust_remote_code": True,
         "disable_radix_cache": True,
+    }
+elif _is_corex:
+    _extra_engine_kwargs = {
+        "trust_remote_code": True,
+        "watchdog_timeout": 3600,
+        "attention_backend": os.environ.get("ATTENTION_BACKEND", "fa2"),
+        "disable_cuda_graph": False,
+        "disable_piecewise_cuda_graph": True,
+        "cuda_graph_max_bs": int(os.environ.get("CUDA_GRAPH_MAX_BS", "16")),
     }
 else:
     _extra_engine_kwargs = {"trust_remote_code": True}
@@ -150,14 +157,12 @@ def _image_uri(name: str) -> str:
 def run_engine():
     from sglang.srt.entrypoints.engine import Engine
 
-    print(f"watchdog_timeout={WATCHDOG_TIMEOUT}s")
     engine = Engine(
         model_path=MODEL_PATH,
         tp_size=TP_SIZE,
         mem_fraction_static=0.85,
         disable_cuda_graph=True,
         disable_piecewise_cuda_graph=True,
-        watchdog_timeout=WATCHDOG_TIMEOUT,
         **_extra_engine_kwargs,
     )
 

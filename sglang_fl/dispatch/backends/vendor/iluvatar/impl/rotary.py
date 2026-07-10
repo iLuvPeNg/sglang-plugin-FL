@@ -19,13 +19,13 @@ def rotary_embedding_iluvatar(
     Apply rotary position embedding using SGLang apply_rotary_emb.
 
     Args:
-        obj: The calling RotaryEmbedding instance (for interface consistency)
-        query: Query tensor [batch, num_heads, head_dim]
+        obj: The calling RotaryEmbedding instance
+        query: Query tensor
         key: Key tensor
-        cos: Cosine cache [max_seq_len, rotary_dim // 2]
-        sin: Sine cache [max_seq_len, rotary_dim // 2]
+        cos: Cosine cache
+        sin: Sine cache
         position_ids: Position indices
-        rotary_interleaved: Whether to use interleaved rotary (GPT-J style)
+        rotary_interleaved: Whether to use interleaved rotary
         inplace: Whether to modify tensors in-place
 
     Returns:

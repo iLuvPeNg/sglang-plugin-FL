@@ -26,7 +26,7 @@ def topk_iluvatar(
         expert_location_dispatch_info: Optional expert location dispatch info
 
     Returns:
-        TopKOutput (StandardTopKOutput format)
+        TopKOutput
     """
     return obj.forward_cuda(
         hidden_states,

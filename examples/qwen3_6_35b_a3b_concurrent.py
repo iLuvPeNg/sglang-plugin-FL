@@ -20,7 +20,6 @@ Environment variables:
   MAX_TOKENS         Max generation tokens for text (default: 256)
   CONCURRENT_N       Concurrent request count (default: 16)
   IMAGE_DIR          Test image directory (default: examples/test_images/)
-  WATCHDOG_TIMEOUT   Scheduler watchdog in seconds (default: 3600)
 """
 
 import argparse
@@ -37,6 +36,7 @@ import torch
 
 _is_musa = hasattr(torch, "musa") and torch.musa.is_available()
 _is_npu = hasattr(torch, "npu") and torch.npu.is_available()
+_is_corex = hasattr(torch, "corex") and torch.cuda.is_available()
 
 # Must be set before importing sglang.
 if _is_npu:
@@ -51,7 +51,6 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "/models/Qwen3.6-35B-A3B")
 TP_SIZE = int(os.environ.get("TP_SIZE", "4" if _is_npu else "1"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "256"))
 CONCURRENT_N = int(os.environ.get("CONCURRENT_N", "16"))
-WATCHDOG_TIMEOUT = float(os.environ.get("WATCHDOG_TIMEOUT", "3600"))
 
 _HERE = Path(__file__).resolve().parent
 IMAGE_DIR = Path(os.environ.get("IMAGE_DIR", _HERE / "test_images"))
@@ -65,6 +64,15 @@ elif _is_npu:
         "dtype": "bfloat16",
         "trust_remote_code": True,
         "disable_radix_cache": True,
+    }
+elif _is_corex:
+    _extra_engine_kwargs = {
+        "trust_remote_code": True,
+        "watchdog_timeout": 3600,
+        "attention_backend": os.environ.get("ATTENTION_BACKEND", "fa2"),
+        "disable_cuda_graph": False,
+        "disable_piecewise_cuda_graph": True,
+        "cuda_graph_max_bs": int(os.environ.get("CUDA_GRAPH_MAX_BS", "16")),
     }
 else:
     _extra_engine_kwargs = {"trust_remote_code": True}
@@ -174,14 +182,12 @@ def _image_uri(name: str) -> str:
 def _make_engine():
     from sglang.srt.entrypoints.engine import Engine
 
-    print(f"watchdog_timeout={WATCHDOG_TIMEOUT}s")
     return Engine(
         model_path=MODEL_PATH,
         tp_size=TP_SIZE,
         mem_fraction_static=0.85,
         disable_cuda_graph=True,
         disable_piecewise_cuda_graph=True,
-        watchdog_timeout=WATCHDOG_TIMEOUT,
         **_extra_engine_kwargs,
     )
 

@@ -18,7 +18,7 @@ def rms_norm_iluvatar(
     Args:
         obj: The calling RMSNorm instance (provides obj.weight, obj.variance_epsilon)
         x: Input tensor
-        residual: Optional residual tensor (post_residual_addition merged by bridge)
+        residual: Optional residual tensor
 
     Returns:
         Normalized tensor, or tuple of (normalized, residual) if residual provided

@@ -12,7 +12,5 @@ def gemma_rms_norm_iluvatar(
     x: torch.Tensor,
     residual: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """
-    GemmaRMSNorm using SGLang's native kernel.
-    """
+    """GemmaRMSNorm using SGLang's native kernel."""
     return obj._forward_impl(x, residual)
